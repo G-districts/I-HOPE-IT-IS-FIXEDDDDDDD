@@ -119,7 +119,7 @@
     border:1px solid var(--border); border-radius:10px; padding:10px; background:#fff; display:flex; align-items:center; gap:8px;
   }
   .scene-title{font-weight:700}
-  .menu{margin-left:auto; display:flex; gap:6px}
+  .menu{margin-left:auto; display:flex; gap:6px; flex-wrap:wrap;}
   .menu .btn{padding:6px 8px}
   .muted{color:var(--muted); font-size:13px}
 
@@ -290,7 +290,7 @@
     position: fixed;
     inset: 0;
     background: rgba(0,0,0,0.35);
-    display: none;          /* toggled via JS */
+    display: none;
     align-items: center;
     justify-content: center;
     z-index: 9999;
@@ -584,7 +584,7 @@
 <!-- Per-student controls -->
 <dialog id="perStudentDlg">
   <h4>Per-Student Controls</h4>
-  <div class="row" style="flex-wrap:wrap">
+  <div class="row" style="flex-wrap:wrap;gap:6px">
     <select id="studentSelect"></select>
     <button class="btn" id="stuFocusOn">Focus ON</button>
     <button class="btn" id="stuFocusOff">Focus OFF</button>
@@ -595,9 +595,10 @@
     <button class="btn" id="stuCloseTabs">Close Tabs</button>
     <button class="btn" id="stuNotify">Notify…</button>
     <button class="btn" id="stuDM">DM…</button>
-    <button class="btn secondary" id="perStuClose">Close</button>
-  </div>
-</dialog>
+    <!-- NEW per-student announcement & exam controls -->
+    <button class="btn" id="stuAnnounce">Announcement…</button>
+    <button class="btn" id="stuExamStart">Start Exam…</button>
+    <button class="btn" id="stuExamEnd">End Exam</button>
     <button class="btn secondary" id="perStuClose">Close</button>
   </div>
 </dialog>
@@ -642,7 +643,7 @@
   </div>
 </dialog>
 
-<!-- DM small dialog (not used for main chat anymore, but kept harmless) -->
+<!-- DM small dialog -->
 <dialog id="dmDlg">
   <h4>Message Student</h4>
   <textarea id="dmInput" rows="3" placeholder="Type a private message"></textarea>
@@ -652,7 +653,7 @@
   </div>
 </dialog>
 
-<!-- Exam mode -->
+<!-- Exam mode (class-wide) -->
 <dialog id="examDlg">
   <h4>Exam Mode</h4>
   <input id="examUrl" placeholder="https://exam.example.com" style="width:100%; padding:8px; border:1px solid #e2e2e2; border-radius:8px">
@@ -691,6 +692,17 @@
       <button class="btn" id="sceneSave">Save</button>
       <button class="btn secondary" id="sceneCancel">Cancel</button>
     </div>
+  </div>
+</dialog>
+
+<!-- Assign Scene to Students (per-student scenes area) -->
+<dialog id="sceneAssignDlg">
+  <h4 id="sceneAssignTitle">Assign Scene</h4>
+  <p class="muted">Check the students who should use this scene. A student can be in multiple scenes at the same time.</p>
+  <div id="sceneAssignList" class="tabslist" style="max-height:260px; margin-top:8px"></div>
+  <div class="row" style="justify-content:flex-end; margin-top:8px">
+    <button class="btn" id="sceneAssignSave">Save</button>
+    <button class="btn secondary" id="sceneAssignCancel">Cancel</button>
   </div>
 </dialog>
 
@@ -785,7 +797,7 @@ async function loadData(){
   $('#classTitle').textContent = j.classes.period1.name || 'MEGACLASS';
   $('#updateTime').textContent = 'Update Time';
 
-  CLASS_STATE.active = !!j.classes.period1.active;  // track current active state
+  CLASS_STATE.active = !!j.classes.period1.active;
 }
 loadData();
 
@@ -868,7 +880,7 @@ async function refreshPresence(){
     `;
     card.appendChild(r1);
 
-    // thumb bar (per-tab last photos)
+    // thumb bar
     const bar = document.createElement('div'); 
     bar.className='thumbbar';
     const tabs = (info.tabs||[]).slice(0,8);
@@ -880,7 +892,6 @@ async function refreshPresence(){
       img.title = t.title || t.url || '';
       bar.appendChild(img);
     });
-    // also show cached shots for tabs that might not be in info (if offline)
     if(isOffline && cache.tabshots){
       const extra = Object.entries(cache.tabshots).slice(0,8);
       extra.forEach(([_, meta])=>{
@@ -937,6 +948,7 @@ async function loadYouTubeRules(){
   document.getElementById('ytAllowMode').checked=!!r.allow_mode;
 }
 loadYouTubeRules();
+
 /* -----------------------------------------------------------
    Legacy student modal (kept)
 ----------------------------------------------------------- */
@@ -960,7 +972,7 @@ function openStudent(student, info){
     };
     x.onclick=async()=>{
       await fetch('/api/command',{method:'POST',headers:{'Content-Type':'application/json'},body: JSON.stringify({student, command:{type:'close_tabs', pattern:(t.url||'*').replace(/[#?].*$/,'*')}})});
-      deleteTabShot(student, t.id); // remove cached shot on close
+      deleteTabShot(student, t.id);
       setTimeout(refreshPresence,800);
     };
   });
@@ -1058,10 +1070,8 @@ document.addEventListener('DOMContentLoaded', ()=>{
       if(!raw) return;
       let patt = raw;
       if(/^https?:/i.test(raw)){
-        // Use as-is (match pattern with explicit scheme)
         patt = raw;
       }else if(!raw.includes('*')){
-        // Treat as hostname, convert to Chrome-style match pattern
         const host = raw.replace(/^https?:\/\//i,'');
         patt = '*://' + host + '/*';
       }
@@ -1142,7 +1152,7 @@ $('#pauseBtn').onclick = async ()=>{
   }finally{ hideOverlay(); }
 };
 
-/* Notify */
+/* Notify (class-wide) */
 $('#notifyBtn').onclick = async ()=>{
   const title = prompt('Notification title','Look at the teacher'); if(title===null) return;
   const message = prompt('Message (optional)','Please look up at the teacher now.');
@@ -1215,7 +1225,45 @@ $('#stuDM').onclick=()=>{
   openDM(student, student);
 };
 
-/* Small DM dialog (still works but not primary anymore) */
+/* NEW: Per-student Announcement */
+$('#stuAnnounce').onclick = async ()=>{
+  const student = currentStudent();
+  if(!student){ alert('Pick a student first'); return; }
+  const msg = prompt('Announcement for '+student);
+  if(msg == null) return;
+  await fetch('/api/announce',{
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({ message: msg, student })
+  });
+  toast('Announcement sent to '+student);
+};
+
+/* NEW: Per-student Exam Start / End */
+$('#stuExamStart').onclick = async ()=>{
+  const student = currentStudent();
+  if(!student){ alert('Pick a student first'); return; }
+  const url = prompt('Exam URL for '+student, 'https://');
+  if(url == null || !url.trim()) return;
+  await fetch('/api/exam',{
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({ action: 'start', url: url.trim(), student })
+  });
+  toast('Exam started for '+student);
+};
+$('#stuExamEnd').onclick = async ()=>{
+  const student = currentStudent();
+  if(!student){ alert('Pick a student first'); return; }
+  await fetch('/api/exam',{
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({ action: 'end', student })
+  });
+  toast('Exam ended for '+student);
+};
+
+/* Small DM dialog */
 $('#dmClose').onclick=()=>$('#dmDlg').close();
 $('#dmSend').onclick=async()=>{
   const text=$('#dmInput').value.trim(); if(!text){ alert('Type a message'); return; }
@@ -1223,7 +1271,6 @@ $('#dmSend').onclick=async()=>{
   await fetch('/api/dm/send',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({student, text, from:'teacher'})});
   $('#dmDlg').close(); toast('DM sent');
 };
-/* Enter to send for DM dialog (Shift+Enter = newline) */
 $('#dmInput').addEventListener('keydown', e => {
   if (e.key === 'Enter' && !e.shiftKey) {
     e.preventDefault();
@@ -1285,6 +1332,7 @@ function sceneItemHtml(s){
       <div class="menu">
         <button class="btn secondary" data-act="set-default">Set as Default</button>
         <button class="btn secondary" data-act="edit">Edit</button>
+        <button class="btn secondary" data-act="assign">Assign…</button>
         <button class="btn secondary" data-act="share">Share</button>
         <button class="btn secondary" data-act="copy">Copy</button>
         <button class="btn secondary" data-act="delete">Delete</button>
@@ -1308,6 +1356,7 @@ function renderSceneLists(){
       if(act==='delete') deleteScene(id);
       if(act==='copy') copyScene(id);
       if(act==='set-default') setDefaultScene(id);
+      if(act==='assign') openSceneAssign(id);
       if(act==='share') alert('Share UI not implemented yet');
     });
   });
@@ -1435,6 +1484,58 @@ async function setDefaultScene(id){
   toast('Default scene set');
 }
 loadScenes();
+
+/* ===== Per-student Scene Assign dialog ===== */
+let sceneAssignId = null;
+function getAllKnownStudents(){
+  const set = new Set();
+  Object.keys(studentCache || {}).forEach(s=> set.add(s));
+  Object.keys(state.presence || {}).forEach(s=> set.add(s));
+  return Array.from(set).sort();
+}
+function openSceneAssign(id){
+  const allScenes = state.scenes.allowed.concat(state.scenes.blocked);
+  const scene = allScenes.find(x=>x.id===id);
+  if(!scene) return;
+  sceneAssignId = id;
+  $('#sceneAssignTitle').textContent = 'Assign: ' + (scene.name || '');
+  const assignedArr = scene.assigned_students || scene.students || scene.assigned || [];
+  const assigned = new Set(assignedArr || []);
+  const list = $('#sceneAssignList');
+  list.innerHTML = '';
+  const students = getAllKnownStudents();
+  if(!students.length){
+    list.innerHTML = '<div class="muted">No students available yet.</div>';
+  }else{
+    students.forEach(stu=>{
+      const row = document.createElement('label');
+      row.className = 'tabrow';
+      row.style.cursor='pointer';
+      row.innerHTML = `
+        <input type="checkbox" class="sceneAssignChk" value="${stu}">
+        <span>${escapeHtml(stu)}</span>
+      `;
+      const cb = row.querySelector('input');
+      if(assigned.has(stu)) cb.checked = true;
+      list.appendChild(row);
+    });
+  }
+  $('#sceneAssignDlg').showModal();
+}
+$('#sceneAssignCancel').onclick = ()=> $('#sceneAssignDlg').close();
+$('#sceneAssignSave').onclick = async ()=>{
+  if(!sceneAssignId){ $('#sceneAssignDlg').close(); return; }
+  const checks = $$('#sceneAssignList .sceneAssignChk');
+  const students = checks.filter(c=>c.checked).map(c=>c.value);
+  await fetch('/api/scenes/apply',{
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({ scene_id: sceneAssignId, students })
+  });
+  toast('Scene assignments updated');
+  $('#sceneAssignDlg').close();
+  loadScenes();
+};
 
 /* -----------------------------------------------------------
    Views wiring (timeline, shots, attention, scenes share)
@@ -1618,7 +1719,7 @@ function renderTabstrip(){
           command: { type:'close_tabs', pattern: (t.url||'*').replace(/[#?].*$/,'*') }
         })
       });
-      deleteTabShot(MON.student, t.id); // purge cached shot when closed
+      deleteTabShot(MON.student, t.id);
       await pullOnePresence();
     };
     monTabstrip.appendChild(chip);
@@ -1642,7 +1743,6 @@ async function pullOnePresence(){
   const info = pres[MON.student] || {};
   MON.tabs = info.tabs||[];
 
-  // merge incoming per-tab shots if provided
   const inc = info.tabshots || {};
   for(const [tid,dataUrl] of Object.entries(inc)){
     const t = MON.tabs.find(x=> String(x.id)===String(tid)) || {};
@@ -1690,8 +1790,6 @@ document.addEventListener('fullscreenchange', ()=>{
   if(!document.fullscreenElement) MON.fs = false;
 });
 followChk.onchange = ()=>{ if(followChk.checked) startFollow(); else stopFollow(); };
-
-/* ==================== end Browser-like Monitor ==================== */
 </script>
 
 <script>
@@ -1707,7 +1805,6 @@ const dmCloseBtn= document.getElementById('dmCloseBtn');
 const dmForm    = document.getElementById('dmForm');
 const dmInputBig= document.getElementById('dmInputBig');
 
-/* Open big chat for a student */
 function openDM(studentEmail, displayName){
   currentDmStudent = studentEmail;
   currentDmDisplayName = displayName || studentEmail;
@@ -1741,7 +1838,7 @@ async function loadDmMessages(){
   try{
     const res = await fetch('/api/dm/me?student=' + encodeURIComponent(currentDmStudent));
     if (!res.ok) return;
-    const msgs = await res.json(); // array: [{from, user, text, ts}, ...]
+    const msgs = await res.json();
 
     dmMessages.innerHTML = '';
     if (!msgs.length){
