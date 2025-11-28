@@ -195,6 +195,12 @@ def ensure_keys(d):
     d.setdefault("alerts", [])
     d.setdefault("dm", {})
     d.setdefault("audit", [])
+    # global announcement string plus optional per-student overrides
+    d.setdefault("announcements", "")
+    d.setdefault("announcements_per_student", {})
+    # exam state (global) plus optional per-student overrides
+    d.setdefault("exam_state", {})
+    d.setdefault("exam_state_per_student", {})
     # Policy system
     #   policies:           id -> policy object
     #   policy_assignments: { "users": {email: policy_id}, "groups": {group_id: policy_id} }
@@ -243,14 +249,25 @@ def _is_guest_identity(email: str, name: str) -> bool:
 # Scenes Helpers
 # =========================
 def _load_scenes():
+    """Load scenes plus optional per-student assignments.
+
+    Structure in scenes.json:
+    {
+        "allowed": [...],
+        "blocked": [...],
+        "current": {... or None},
+        "assignments": { "student_email": ["scene_id", ...] }
+    }
+    """
     try:
         with open(SCENES_PATH, "r", encoding="utf-8") as f:
             obj = json.load(f)
     except Exception:
-        obj = {"allowed": [], "blocked": [], "current": None}
+        obj = {"allowed": [], "blocked": [], "current": None, "assignments": {}}
     obj.setdefault("allowed", [])
     obj.setdefault("blocked", [])
     obj.setdefault("current", None)
+    obj.setdefault("assignments", {})
     return obj
 
 def _save_scenes(obj):
@@ -258,6 +275,7 @@ def _save_scenes(obj):
     obj.setdefault("allowed", [])
     obj.setdefault("blocked", [])
     obj.setdefault("current", None)
+    obj.setdefault("assignments", {})
     with open(SCENES_PATH, "w", encoding="utf-8") as f:
         json.dump(obj, f, indent=2)
 
@@ -849,6 +867,13 @@ def api_ai_classify():
 # =========================
 @app.route("/api/announce", methods=["POST"])
 def api_announce():
+    """Create an announcement.
+
+    If no student is provided, this behaves like the original "whole class"
+    broadcast. When a single student or a list of students is provided, the
+    announcement is stored as a per-student override which the extension will
+    see via /api/policy.
+    """
     u = current_user()
     if not u or u["role"] not in ("teacher", "admin"):
         return jsonify({"ok": False, "error": "forbidden"}), 403
@@ -862,15 +887,35 @@ def api_announce():
         or (body.get("announcement") or "").strip()
     )
 
-    d["announcements"] = msg
+    # Normalise student inputs: accept "student" or "students" (list)
+    raw_student = (body.get("student") or "").strip()
+    raw_students = body.get("students") or []
+    students = []
 
-    # Tell all extensions to re-fetch /api/policy so they see the new announcement
+    if raw_student:
+        students.append(raw_student)
+    for s in raw_students:
+        s = (s or "").strip()
+        if s and s not in students:
+            students.append(s)
+
+    if students:
+        # Per-student announcements
+        per = d.setdefault("announcements_per_student", {})
+        for s in students:
+            per[s] = msg
+        log_action({"event": "announce_per_student", "students": students, "message": msg})
+    else:
+        # Whole-class / global announcement (original behaviour)
+        d["announcements"] = msg
+        log_action({"event": "announce", "message": msg})
+
+    # Tell extensions to re-fetch /api/policy so they see the new announcement
     d.setdefault("pending_commands", {}).setdefault("*", []).append({
         "type": "policy_refresh"
     })
 
     save_data(d)
-    log_action({"event": "announce", "message": msg})
     return jsonify({"ok": True})
 
 @app.route("/api/class/set", methods=["GET", "POST"])
@@ -1422,12 +1467,14 @@ def api_policy():
     # Scene merge logic (no over-blocking)
     store = _load_scenes()
     current = store.get("current") or None
+    assignments = store.get("assignments", {}) or {}
 
     # Start with class-level lists
     allowlist = list(cls.get("allowlist", []))
     teacher_blocks = list(cls.get("teacher_blocks", []))
     categories = d.get("categories", {}) or {}
 
+    # 1) Apply global "current" scene (backwards compatible behaviour)
     if current:
         scene_obj = None
         for bucket in ("allowed", "blocked"):
@@ -1440,14 +1487,60 @@ def api_policy():
 
         if scene_obj:
             if scene_obj.get("type") == "allowed":
-                # allow-only mode (focus true)
+                # allow-only mode (focus true) for everyone
                 allowlist = list(scene_obj.get("allow", []))
                 focus = True
             elif scene_obj.get("type") == "blocked":
-                # add extra teacher block patterns
+                # add extra teacher block patterns globally
                 teacher_blocks = (teacher_blocks or []) + list(scene_obj.get("block", []))
 
-    # --- Policy system: choose and apply active policy for this student ---
+    # 2) Per-student scene assignments (multiple scenes allowed)
+    student_key = (student or "").strip()
+    # scene ids that apply to this student
+    assigned_ids = []
+    # we normalise keys to both exact and lowercase to be forgiving
+    if student_key:
+        assigned_ids = assignments.get(student_key) or assignments.get(student_key.lower()) or []
+
+    if assigned_ids:
+        # build lookup of id -> scene object
+        id_to_scene = {}
+        for bucket in ("allowed", "blocked"):
+            for s in store.get(bucket, []):
+                sid = str(s.get("id"))
+                id_to_scene[sid] = s
+
+        student_allowed_scenes = []
+        student_blocked_scenes = []
+
+        for sid in assigned_ids:
+            s = id_to_scene.get(str(sid))
+            if not s:
+                continue
+            if s.get("type") == "allowed":
+                student_allowed_scenes.append(s)
+            elif s.get("type") == "blocked":
+                student_blocked_scenes.append(s)
+
+        # Allowed-scenes: union of all allow lists, and force focus mode
+        if student_allowed_scenes:
+            al_set = set()
+            for s in student_allowed_scenes:
+                for u in (s.get("allow") or []):
+                    if u:
+                        al_set.add(u)
+            if al_set:
+                allowlist = list(al_set)
+                focus = True
+
+        # Blocked-scenes: merge additional teacher block patterns
+        if student_blocked_scenes:
+            extra_blocks = []
+            for s in student_blocked_scenes:
+                extra_blocks.extend(list(s.get("block") or []))
+            if extra_blocks:
+                teacher_blocks = (teacher_blocks or []) + extra_blocks
+# --- Policy system: choose and apply active policy for this student ---
     active_policy = _select_active_policy(d, student)
     allowlist, teacher_blocks, categories = _apply_policy_to_lists(
         allowlist,
@@ -1478,7 +1571,7 @@ def api_policy():
         "active_policy": ap,
         "focus_mode": bool(focus),
         "paused": bool(paused),
-        "announcement": d.get("announcements", ""),
+        "announcement": (d.get("announcements_per_student", {}) or {}).get(student, d.get("announcements", "")),
         "class": {
             "id": "period1",
             "name": cls.get("name", "Period 1"),
@@ -1489,7 +1582,7 @@ def api_policy():
         "chat_enabled": d.get("settings", {}).get("chat_enabled", False),
         "pending": pending,
         "ts": int(time.time()),
-        "scenes": {"current": current},
+        "scenes": {"current": current, "assignments": assignments},
         # bypass flags for the extension
         "bypass_enabled": bool(d.get("settings", {}).get("bypass_enabled", False)),
         "bypass_ttl_minutes": int(d.get("settings", {}).get("bypass_ttl_minutes", 10)),
@@ -1848,7 +1941,38 @@ def api_engagement():
 # =========================
 @app.route("/api/scenes", methods=["GET"])
 def api_scenes_list():
-    return jsonify(_load_scenes())
+    """Return scenes plus per-student assignments.
+
+    The payload looks like:
+    {
+        "allowed": [...],
+        "blocked": [...],
+        "current": {... or None},
+        "assignments": { "student_email": ["scene_id", ...] }
+    }
+
+    For convenience, each scene object in "allowed" / "blocked" also includes
+    a synthetic "students" field listing the students currently assigned to
+    that scene. This field is *derived* from "assignments" on each request
+    and is not required to be persisted on disk.
+    """
+    store = _load_scenes()
+    assignments = store.get("assignments", {}) or {}
+
+    # Build reverse mapping scene_id -> [students]
+    by_scene = {}
+    for student, ids in assignments.items():
+        for sid in ids or []:
+            sid_str = str(sid)
+            by_scene.setdefault(sid_str, []).append(student)
+
+    # Annotate scenes with "students" list
+    for bucket in ("allowed", "blocked"):
+        for s in store.get(bucket, []):
+            sid = str(s.get("id"))
+            s["students"] = sorted(by_scene.get(sid, []))
+
+    return jsonify(store)
 
 @app.route("/api/scenes", methods=["POST"])
 def api_scenes_create():
@@ -1986,6 +2110,73 @@ def api_scenes_apply():
     d.setdefault("pending_commands", {}).setdefault("*", []).append({"type": "policy_refresh"})
     save_data(d)
     return jsonify({"ok": True, "current": found})
+
+
+@app.route("/api/scenes/assign", methods=["POST"])
+def api_scenes_assign():
+    """Assign or unassign a scene for specific students.
+
+    Expected payload:
+    {
+        "id": "<scene_id>",
+        "students": ["email1", "email2", ...]
+    }
+
+    The provided list is treated as the *authoritative* list of students
+    for that scene: any students currently assigned but not present in the
+    list will be unassigned, and any new students will be added.
+    Multiple scenes can be assigned to the same student.
+    """
+    u = current_user()
+    if not u or u["role"] not in ("teacher", "admin"):
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+
+    body = request.json or {}
+    sid = body.get("id") or body.get("scene_id")
+    raw_students = body.get("students") or []
+
+    if not sid:
+        return jsonify({"ok": False, "error": "scene_id required"}), 400
+
+    # Normalise student identifiers
+    new_students = []
+    for s in raw_students:
+        s_norm = (s or "").strip()
+        if s_norm and s_norm not in new_students:
+            new_students.append(s_norm)
+
+    scenes = _load_scenes()
+    assignments = scenes.setdefault("assignments", {})
+
+    sid_str = str(sid)
+
+    # 1) Remove this scene from any students no longer in the list
+    for student, ids in list(assignments.items()):
+        ids_list = [str(x) for x in (ids or [])]
+        if sid_str in ids_list and student not in new_students:
+            ids_list = [x for x in ids_list if x != sid_str]
+            if ids_list:
+                assignments[student] = ids_list
+            else:
+                assignments.pop(student, None)
+
+    # 2) Ensure each student in new_students has this scene id in their list
+    for student in new_students:
+        ids_list = [str(x) for x in (assignments.get(student) or [])]
+        if sid_str not in ids_list:
+            ids_list.append(sid_str)
+        assignments[student] = ids_list
+
+    scenes["assignments"] = assignments
+    _save_scenes(scenes)
+
+    # Push a policy refresh so extensions pick up the new per-student scenes
+    d = ensure_keys(load_data())
+    d.setdefault("pending_commands", {}).setdefault("*", []).append({"type": "policy_refresh"})
+    save_data(d)
+
+    log_action({"event": "scene_assign", "scene_id": sid_str, "students": new_students})
+    return jsonify({"ok": True, "assignments": assignments})
 
 @app.route("/api/scenes/clear", methods=["POST"])
 def api_scenes_clear():
@@ -2419,28 +2610,84 @@ def api_student_open_tabs():
 # =========================
 @app.route("/api/exam", methods=["POST"])
 def api_exam():
+    """Control exam mode.
+
+    Original behaviour (no student specified) broadcasts exam_start /
+    exam_end to the whole class using the wildcard "*" target.
+
+    When a single student or a list of students is provided, the same
+    commands are queued only for those students via pending_per_student,
+    and a per-student exam_state entry is maintained.
+    """
     u = current_user()
     if not u or u["role"] not in ("teacher", "admin"):
         return jsonify({"ok": False, "error": "forbidden"}), 403
+
     body = request.json or {}
     action = (body.get("action") or "").strip()
     url = (body.get("url") or "").strip()
+
+    # Normalise targets
+    raw_student = (body.get("student") or "").strip()
+    raw_students = body.get("students") or []
+    targets = []
+
+    if raw_student:
+        targets.append(raw_student)
+    for s in raw_students:
+        s = (s or "").strip()
+        if s and s not in targets:
+            targets.append(s)
+
     d = ensure_keys(load_data())
+
     if action == "start":
         if not url:
             return jsonify({"ok": False, "error": "url required"}), 400
-        d.setdefault("pending_commands", {}).setdefault("*", []).append({"type": "exam_start", "url": url})
-        d.setdefault("exam_state", {})["active"] = True
-        d["exam_state"]["url"] = url
+
+        if targets:
+            # Per-student exam start
+            per = d.setdefault("pending_per_student", {})
+            state_per = d.setdefault("exam_state_per_student", {})
+            now_ts = int(time.time())
+            for s in targets:
+                arr = per.setdefault(s, [])
+                arr.append({"type": "exam_start", "url": url, "ts": now_ts})
+                state_per[s] = {"active": True, "url": url, "ts": now_ts}
+            log_action({"event": "exam", "scope": "per_student", "action": "start", "url": url, "students": targets})
+        else:
+            # Whole-class exam start (original behaviour)
+            d.setdefault("pending_commands", {}).setdefault("*", []).append({"type": "exam_start", "url": url})
+            state = d.setdefault("exam_state", {})
+            state["active"] = True
+            state["url"] = url
+            log_action({"event": "exam", "scope": "class", "action": "start", "url": url})
+
         save_data(d)
-        log_action({"event": "exam", "action": "start", "url": url})
         return jsonify({"ok": True})
+
     elif action == "end":
-        d.setdefault("pending_commands", {}).setdefault("*", []).append({"type": "exam_end"})
-        d.setdefault("exam_state", {})["active"] = False
+        if targets:
+            # Per-student exam end
+            per = d.setdefault("pending_per_student", {})
+            state_per = d.setdefault("exam_state_per_student", {})
+            now_ts = int(time.time())
+            for s in targets:
+                arr = per.setdefault(s, [])
+                arr.append({"type": "exam_end", "ts": now_ts})
+                if s in state_per:
+                    state_per[s]["active"] = False
+            log_action({"event": "exam", "scope": "per_student", "action": "end", "students": targets})
+        else:
+            # Whole-class exam end (original behaviour)
+            d.setdefault("pending_commands", {}).setdefault("*", []).append({"type": "exam_end"})
+            state = d.setdefault("exam_state", {})
+            state["active"] = False
+            log_action({"event": "exam", "scope": "class", "action": "end"})
+
         save_data(d)
-        log_action({"event": "exam", "action": "end"})
         return jsonify({"ok": True})
+
     return jsonify({"ok": False, "error": "invalid action"}), 400
 
 @app.route("/api/exam_violation", methods=["POST"])
