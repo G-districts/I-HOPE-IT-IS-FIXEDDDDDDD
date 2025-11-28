@@ -2493,6 +2493,7 @@ def api_notify():
     u = current_user()
     if not u or u["role"] not in ("teacher", "admin"):
         return jsonify({"ok": False, "error": "forbidden"}), 403
+
     b = request.json or {}
     title = (b.get("title") or "G School")[:120]
     message = (b.get("message") or "")[:500]
@@ -2506,26 +2507,10 @@ def api_notify():
         "title": title,
         "message": message,
     })
+
     save_data(d)
     log_action({"event": "notify", "title": title, "target": target})
     return jsonify({"ok": True})
-     url = (b.get("url") or "").strip()
-        reason = (b.get("reason") or "blocked_visit")
-        log_action({"event": "off_task", "student": student, "url": url, "reason": reason, "ts": int(time.time())})
-        d = ensure_keys(load_data())
-        d.setdefault("pending_commands", {}).setdefault("*", []).append({
-            "type": "notify",
-            "title": "Off-task detected",
-            "message": f"{student or 'Student'} visited a blocked page."
-        })
-        save_data(d)
-        return jsonify({"ok": True})
-    except Exception as e:
-        try:
-            log_action({"event": "off_task_error", "error": str(e)})
-        except:
-            pass
-        return jsonify({"ok": False}), 500
 
 
 # =========================
@@ -2535,3 +2520,4 @@ if __name__ == "__main__":
     # Ensure data.json exists and is sane on boot
     save_data(ensure_keys(load_data()))
     app.run(host="0.0.0.0", port=5000, debug=True)
+
